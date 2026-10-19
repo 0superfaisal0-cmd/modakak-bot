@@ -57,9 +57,21 @@ BOT_USERNAME = os.environ.get("BOT_USERNAME", "Al_Modaqaq_Bot").lstrip("@").lowe
 # لو تبغاه يرد على أي رسالة تنتهي بعلامة استفهام في القروب حط "1"
 RESPOND_TO_QUESTIONS = os.environ.get("RESPOND_TO_QUESTIONS", "0") == "1"
 
+def _norm_id(v: str) -> str:
+    """يوحّد الأرقام العربية لإنجليزية ويشيل المسافات."""
+    v = (v or "").strip().replace(" ", "")
+    return v.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789"))
+
+
 # قفل البوت على قروب المدقق وصاحبه
-ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
-OWNER_USER_ID = os.environ.get("OWNER_USER_ID", "").strip()
+ALLOWED_CHAT_ID = _norm_id(os.environ.get("ALLOWED_CHAT_ID", ""))
+OWNER_USER_ID = _norm_id(os.environ.get("OWNER_USER_ID", ""))
+if ALLOWED_CHAT_ID and not re.fullmatch(r"-?\d+", ALLOWED_CHAT_ID):
+    log.error("ALLOWED_CHAT_ID غير صالح: %r - البوت بيشتغل بوضع الإعداد (مفتوح) لين تصلحه", ALLOWED_CHAT_ID)
+    ALLOWED_CHAT_ID = ""
+if OWNER_USER_ID and not re.fullmatch(r"\d+", OWNER_USER_ID):
+    log.error("OWNER_USER_ID غير صالح: %r - تم تجاهله", OWNER_USER_ID)
+    OWNER_USER_ID = ""
 
 # رابط قروب المدقق - يُرسل لمن يكلّم البوت برّا القروب
 GROUP_INVITE_LINK = "https://t.me/L69XdHpEl7tjZTJk"
@@ -352,26 +364,42 @@ MEMBER_TTL = 600
 member_ok: dict[int, float] = {}
 
 
+def _is_in(member) -> bool:
+    """عضو فعلا؟ يشمل حالة restricted لو is_member=True."""
+    st = member.status
+    if st in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+        return False
+    if st == ChatMemberStatus.RESTRICTED:
+        return bool(getattr(member, "is_member", False))
+    return True
+
+
 async def is_channel_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
     """يتأكد ان المستخدم عضو في قناة المدقق وقروب المناقشة.
     اي خطأ (مو عضو، البوت مو مشرف بالقناة، مشكلة شبكة) = نعتبره غير عضو
-    ونرسل له رسالة الانضمام بدل ما نعلّق.
-    """
+    ونرسل له رسالة الانضمام بدل ما نعلّق. السبب يتسجل في اللوق."""
     now = time.time()
     if member_ok.get(user_id, 0) > now:
         return True
     try:
         ch = await context.bot.get_chat_member(CHANNEL_USERNAME, user_id)
-        if ch.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
-            return False
-        # فحص القروب بس بعد ما يتعبى ALLOWED_CHAT_ID
-        if ALLOWED_CHAT_ID:
-            gr = await context.bot.get_chat_member(int(ALLOWED_CHAT_ID), user_id)
-            if gr.status in (ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
-                return False
     except Exception as e:
-        log.info("membership check failed for %s: %s", user_id, str(e)[:120])
+        log.info("membership: channel check failed user=%s err=%s", user_id, str(e)[:150])
         return False
+    if not _is_in(ch):
+        log.info("membership: user=%s not in channel (status=%s)", user_id, ch.status)
+        return False
+    # فحص القروب بس بعد ما يتعبى ALLOWED_CHAT_ID
+    if ALLOWED_CHAT_ID:
+        try:
+            gr = await context.bot.get_chat_member(int(ALLOWED_CHAT_ID), user_id)
+        except Exception as e:
+            log.info("membership: group check failed user=%s group=%s err=%s",
+                     user_id, ALLOWED_CHAT_ID, str(e)[:150])
+            return False
+        if not _is_in(gr):
+            log.info("membership: user=%s not in group (status=%s)", user_id, gr.status)
+            return False
     member_ok[user_id] = now + MEMBER_TTL
     return True
 
