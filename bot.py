@@ -36,7 +36,7 @@ import logging
 from collections import defaultdict, deque
 
 from telegram import Update
-from telegram.constants import ChatType, ChatMemberStatus, Poll
+from telegram.constants import ChatType, ChatMemberStatus, PollType
 from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
 
 from google import genai
@@ -503,7 +503,7 @@ async def send_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=msg.chat_id,
         question=q["q"],
         options=q["options"],
-        type=Poll.QUIZ,
+        type=PollType.QUIZ,
         correct_option_id=q["correct"],
         explanation=q.get("why") or None,
         is_anonymous=False,
