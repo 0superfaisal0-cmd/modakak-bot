@@ -777,7 +777,41 @@ def start_health_server():
     log.info("health server listening on port %s", port)
 
 
+def ensure_kami_images():
+    """يفك ضغط kami.zip إلى مجلد kami/ إذا كان المجلد مفقودًا (يحصل لما يُرفع الملف مضغوطًا للريبو).
+    يتعامل مع zip فيه مجلد kami/ داخلي أو ملفات مباشرة، ويتجاهل المسارات غير الآمنة،
+    ولا يوقف البوت أبدًا - يسجل النتيجة في السجل فقط."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    kami_dir = os.path.join(base, "kami")
+    try:
+        if os.path.isdir(kami_dir) and any(n.lower().endswith(".jpg") for n in os.listdir(kami_dir)):
+            return  # الصور موجودة أصلاً
+        zip_path = os.path.join(base, "kami.zip")
+        if not os.path.isfile(zip_path):
+            log.warning("kami images missing: no kami/ folder and no kami.zip next to bot.py")
+            return
+        import zipfile
+        os.makedirs(kami_dir, exist_ok=True)
+        count = 0
+        with zipfile.ZipFile(zip_path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                parts = [p for p in info.filename.replace("\\", "/").split("/") if p not in ("", ".")]
+                if parts and parts[0].lower() == "kami":
+                    parts = parts[1:]  # zip فيه مجلد kami/ داخلي
+                if len(parts) != 1 or not parts[0].lower().endswith((".jpg", ".jpeg", ".png")):
+                    continue  # مسار غير آمن أو ملف مو صورة: نتجاهله
+                with zf.open(info) as fsrc, open(os.path.join(kami_dir, parts[0]), "wb") as fdst:
+                    fdst.write(fsrc.read())
+                count += 1
+        log.info("kami.zip extracted: %s images into kami/", count)
+    except Exception as e:
+        log.warning("kami.zip extract failed (bot continues): %s", str(e)[:150])
+
+
 def main():
+    ensure_kami_images()
     load_memory()
     start_health_server()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
