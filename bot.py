@@ -33,6 +33,7 @@
 import os
 import re
 import time
+import hashlib
 import asyncio
 import logging
 from collections import defaultdict, deque
@@ -42,7 +43,7 @@ from telegram.constants import ChatType, ChatMemberStatus, PollType
 from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
 
 from google import genai
-from google.genai import types
+from google.genai import types, errors as genai_errors
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("modakak")
@@ -52,9 +53,19 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
-# نماذج احتياطية لو الأساسي ضاغط (الطبقة المجانية تتأثر بضغط الطلب)
-MODEL_FALLBACKS = [GEMINI_MODEL, "gemini-3.8-flash", "gemini-3.5-flash-lite"]
+# أسماء النماذج مؤكدة من وثائق جوجل الرسمية (ai.google.dev/gemini-api/docs/models).
+# الجودة فقط بلا أي بديل أضعف: الدردشة والشرح كلاهما يبدأ بـ gemini-3.8-flash
+# (تصفه جوجل بأذكى نموذج Flash) ثم gemini-3.6-flash احتياط عند الأعطال.
+# لا يوجد أي نموذج lite في السلسلة - لو فشل الاثنان يعتذر البوت برسالة واضحة.
+CHAT_MODELS = [
+    os.environ.get("GEMINI_CHAT_MODEL", "gemini-3.8-flash"),
+    "gemini-3.6-flash",
+]
+# الشرح والأسئلة الرياضية: نفس السلسلة القوية فقط.
+SMART_MODELS = [
+    os.environ.get("GEMINI_SMART_MODEL", "gemini-3.8-flash"),
+    "gemini-3.6-flash",
+]
 BOT_USERNAME = os.environ.get("BOT_USERNAME", "Al_Modaqaq_Bot").lstrip("@").lower()
 # لو تبغاه يرد على أي رسالة تنتهي بعلامة استفهام في القروب حط "1"
 RESPOND_TO_QUESTIONS = os.environ.get("RESPOND_TO_QUESTIONS", "0") == "1"
@@ -356,10 +367,29 @@ COOLDOWN_SECONDS = 5     # فاصل بسيط بين رد ورد لنفس الم�
 
 genai_client = genai.Client(
     api_key=GEMINI_API_KEY,
-    http_options=types.HttpOptions(timeout=45_000),  # مهلة طلب HTTP (بالمللي ثانية)
+    http_options=types.HttpOptions(
+        timeout=30_000,  # مهلة طلب HTTP (بالمللي ثانية)
+        retry_options=types.HttpRetryOptions(attempts=1),  # لا إعادة محاولات داخلية - نتحكم بها نحن
+    ),
 )
 GEMINI_SEM = asyncio.Semaphore(3)   # أقصى عدد طلبات متزامنة للنموذج
 GEMINI_TOTAL_CAP = 100              # مهلة إجمالية للسؤال الواحد (ثانية)
+QUEUE_WAIT_SECONDS = 15             # أقصى انتظار بالطابور قبل الاعتذار (بدل تعليق مفتوح)
+RATE_LIMIT_COOLDOWN = 60            # تهدئة النموذج بعد 429 (حد طلبات)
+BUSY_COOLDOWN = 30                  # تهدئة النموذج بعد 503/5xx (ضغط على مزوّد الخدمة)
+# تهدئة لكل نموذج على حدة: النموذج المزدحم عند المزوّد يُتخطى مؤقتًا بدل ما يستهلك
+# محاولات كل طالب، بينما يكمل النموذج الآخر القوي يخدمهم. تُرفع التهدئة تلقائيًا.
+_model_cooldown: dict[str, float] = {}
+
+# كاش شروحات الكويزات: سؤال الكويز وجوابه ثابتان للجميع، فالشرح يتولّد مرة واحدة
+# ويُخدَّم لكل الطلاب بعدها بدون استهلاك طلبات ذكاء. لا يحوي أي بيانات شخصية.
+# تنبيه: الشرح المخزن نص مولّد بالنموذج وليس مراجعة بشرية - الموثّق هو حرف الإجابة
+# من ملف المصدر فقط. المفتاح يشمل السؤال والخيارات والإجابة والصورة ورقم إصدار:
+# أي تعديل على البنوك أو برومبت الشرح يستدعي رفع EXPLAIN_CACHE_VERSION درجة.
+EXPLAIN_CACHE_VERSION = 1
+EXPLAIN_CACHE_FILE = os.environ.get("EXPLAIN_CACHE_FILE", "explain_cache.json")
+EXPLAIN_CACHE_MAX = 500
+explain_cache: dict[str, str] = {}
 
 # ذاكرة منفصلة لكل شخص داخل كل محادثة: المفتاح "chat_id:user_id".
 # تُحفظ في ملف memory.json - ملاحظة: على Render المجاني الذاكرة ترجع صفر عند إعادة النشر.
@@ -370,6 +400,27 @@ histories: dict[str, deque] = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 last_reply: dict[str, float] = defaultdict(float)
 lock = asyncio.Lock()
 _save_counter = 0
+
+
+def load_explain_cache():
+    try:
+        with open(EXPLAIN_CACHE_FILE, encoding="utf-8") as fh:
+            explain_cache.update(_json.load(fh))
+        log.info("explain cache loaded: %s entries", len(explain_cache))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("explain cache load failed: %s", str(e)[:120])
+
+
+def save_explain_cache():
+    try:
+        while len(explain_cache) > EXPLAIN_CACHE_MAX:
+            explain_cache.pop(next(iter(explain_cache)))
+        with open(EXPLAIN_CACHE_FILE, "w", encoding="utf-8") as fh:
+            _json.dump(explain_cache, fh, ensure_ascii=False)
+    except Exception as e:
+        log.warning("explain cache save failed: %s", str(e)[:120])
 
 
 def load_memory():
@@ -455,12 +506,44 @@ def should_respond(update: Update) -> bool:
     return False
 
 
-def _gen_call(contents, system_instruction, temperature, max_tokens):
-    last_err = None
-    for model in MODEL_FALLBACKS:
-        for attempt in range(2):  # محاولة ثانية بعد مهلة قصيرة لكل نموذج
+class GeminiAllFailed(Exception):
+    """كل النماذج فشلت - يحمل نوع الفشل (quota/busy/timeout/auth/other) للرسالة المناسبة."""
+    def __init__(self, cls, err):
+        super().__init__(str(err)[:200])
+        self.cls = cls
+
+
+def classify_gemini_error(e) -> str:
+    """تصنيف خطأ Gemini: rate_limit (429) أو busy (5xx) أو timeout أو auth أو غيره."""
+    if isinstance(e, genai_errors.APIError):
+        code = getattr(e, "code", None)
+        if code == 429:
+            return "rate_limit"
+        if code in (500, 502, 503, 504):
+            return "busy"
+        if code in (401, 403):
+            return "auth"
+        if code == 404:
+            return "model_missing"
+        return "api"
+    if isinstance(e, TimeoutError):
+        return "timeout"
+    s = str(e).lower()
+    if "timeout" in s or "timed out" in s or "deadline" in s:
+        return "timeout"
+    return "other"
+
+
+def _gen_call(contents, system_instruction, temperature, max_tokens, models):
+    last_err, last_cls = None, "busy"
+    for model in models:
+        if time.time() < _model_cooldown.get(model, 0):
+            log.info("gemini skip model=%s (cooldown)", model)
+            continue
+        for attempt in range(2):  # محاولة ثانية سريعة فقط لو السبب ضغط/حصة
+            t0 = time.time()
             try:
-                return genai_client.models.generate_content(
+                resp = genai_client.models.generate_content(
                     model=model,
                     contents=contents,
                     config=types.GenerateContentConfig(
@@ -469,22 +552,51 @@ def _gen_call(contents, system_instruction, temperature, max_tokens):
                         max_output_tokens=max_tokens,
                     ),
                 )
+                log.info("gemini ok model=%s attempt=%s %.1fs", model, attempt + 1, time.time() - t0)
+                return resp
             except Exception as e:
-                last_err = e
-                err = str(e)
-                if "503" in err or "429" in err or "UNAVAILABLE" in err or "RESOURCE_EXHAUSTED" in err:
-                    log.warning("model %s busy (attempt %s): %s", model, attempt + 1, err[:120])
-                    time.sleep(1.5 * (attempt + 1))
+                cls = classify_gemini_error(e)
+                last_err, last_cls = e, cls
+                log.warning(
+                    "gemini fail class=%s model=%s attempt=%s %.1fs: %s",
+                    cls, model, attempt + 1, time.time() - t0, str(e)[:150],
+                )
+                if cls in ("rate_limit", "busy") and attempt == 0:
+                    time.sleep(1.0)
                     continue
-                raise
-    raise last_err
+                break  # أخطاء ثانية (مفتاح/نموذج مفقود/غيره): جرّب النموذج التالي فورًا
+        if last_cls == "rate_limit":
+            _model_cooldown[model] = time.time() + RATE_LIMIT_COOLDOWN
+        elif last_cls == "busy":
+            _model_cooldown[model] = time.time() + BUSY_COOLDOWN
+    raise GeminiAllFailed(last_cls, last_err)
 
 
-async def _generate(contents, system_instruction, temperature=0.7, max_tokens=2048):
-    async with GEMINI_SEM:
+async def _generate(contents, system_instruction, temperature=0.7, max_tokens=2048,
+                    models=None, total_cap=None):
+    try:
+        await asyncio.wait_for(GEMINI_SEM.acquire(), timeout=QUEUE_WAIT_SECONDS)
+    except asyncio.TimeoutError:
+        raise GeminiAllFailed("busy", "queue full")
+    try:
         return await asyncio.wait_for(
-            asyncio.to_thread(_gen_call, contents, system_instruction, temperature, max_tokens),
-            timeout=GEMINI_TOTAL_CAP)
+            asyncio.to_thread(_gen_call, contents, system_instruction, temperature, max_tokens,
+                              models or CHAT_MODELS),
+            timeout=total_cap or GEMINI_TOTAL_CAP)
+    finally:
+        GEMINI_SEM.release()
+
+
+# ردود واضحة حسب سبب الفشل
+FAIL_REPLIES = {
+    "rate_limit": "الطلبات كثيرة على خدمة الذكاء الحين 😅 جرب تسألني بعد دقيقة أو دقيقتين.",
+    "busy": "الخدمة ضاغطة الحين 😅 جرب تسألني بعد دقيقة.",
+    "timeout": "الخدمة بطيئة الحين وما ردت بوقتها 😅 جرب تسألني بعد دقيقة.",
+    "auth": "فيه خلل بإعداداتي الحين، بيتحل قريب 🙏",
+    "model_missing": "فيه خلل بإعداداتي الحين، بيتحل قريب 🙏",
+    "api": "ما قدرت أرد الحين 😅 جرب بعد شوي.",
+    "other": "ما قدرت أرد الحين 😅 جرب بعد شوي.",
+}
 
 
 async def ask_gemini(user_key: str, user_text: str) -> str:
@@ -492,10 +604,13 @@ async def ask_gemini(user_key: str, user_text: str) -> str:
     contents = list(history) + [types.Content(role="user", parts=[types.Part(text=user_text)])]
     system_instruction = build_system_instruction()
     try:
-        resp = await _generate(contents, system_instruction)
+        resp = await _generate(contents, system_instruction, models=CHAT_MODELS, total_cap=60)
     except asyncio.TimeoutError:
-        log.warning("Gemini total timeout (%s)", user_key)
-        return "ضغط عليّ الحين 😅 جرب تسألني بعد دقيقة."
+        log.warning("gemini total timeout (%s)", user_key)
+        return FAIL_REPLIES["timeout"]
+    except GeminiAllFailed as e:
+        log.warning("gemini all models failed class=%s (%s)", e.cls, user_key)
+        return FAIL_REPLIES.get(e.cls, FAIL_REPLIES["other"])
     answer = (resp.text or "").strip()
     try:
         fr = resp.candidates[0].finish_reason
@@ -614,14 +729,37 @@ async def explain_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parts.append(types.Part.from_bytes(data=fh.read(), mime_type="image/jpeg"))
         except Exception as e:
             log.warning("explain image failed (%s): %s", quiz["image"], str(e)[:120])
+    cache_key = hashlib.sha1(
+        ("v" + str(EXPLAIN_CACHE_VERSION) + "|" + quiz["qtype"] + "|" + quiz["q"]
+         + "|" + "|".join(opts) + "|" + str(ci) + "|" + str(quiz.get("image") or "")).encode("utf-8")
+    ).hexdigest()
+    cached = explain_cache.get(cache_key)
+    if cached:
+        await msg.reply_text(f"الإجابة الصحيحة: ({letters[ci]}) {opts[ci]}\n\n{cached}")
+        return
     contents = [types.Content(role="user", parts=parts)]
     try:
         await context.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-        resp = await _generate(contents, build_system_instruction(), temperature=0.3, max_tokens=1500)
+        resp = await _generate(contents, build_system_instruction(), temperature=0.3,
+                               max_tokens=1500, models=SMART_MODELS, total_cap=GEMINI_TOTAL_CAP)
         answer = clean_answer((resp.text or "").strip())
         if not answer:
             raise ValueError("empty explanation")
+        explain_cache[cache_key] = answer
+        save_explain_cache()
         await msg.reply_text(f"الإجابة الصحيحة: ({letters[ci]}) {opts[ci]}\n\n{answer}")
+    except asyncio.TimeoutError:
+        log.warning("explain timeout")
+        await msg.reply_text(
+            f"الإجابة الصحيحة: ({letters[ci]}) {opts[ci]}\n"
+            "الخدمة بطيئة الحين 😅 قل «اشرح» مرة ثانية بعد دقيقة."
+        )
+    except GeminiAllFailed as e:
+        log.warning("explain failed class=%s: %s", e.cls, str(e)[:120])
+        note = ("الطلبات كثيرة على خدمة الذكاء الحين 😅 قل «اشرح» مرة ثانية بعد دقيقتين."
+                if e.cls == "rate_limit" else
+                "ضغط على الشرح الحين 😅 قل «اشرح» مرة ثانية بعد دقيقة.")
+        await msg.reply_text(f"الإجابة الصحيحة: ({letters[ci]}) {opts[ci]}\n{note}")
     except Exception as e:
         log.warning("explain failed: %s", str(e)[:150])
         await msg.reply_text(
@@ -812,7 +950,9 @@ def ensure_kami_images():
 
 def main():
     ensure_kami_images()
+    load_explain_cache()
     load_memory()
+    log.info("models chat=%s smart=%s", CHAT_MODELS, SMART_MODELS)
     start_health_server()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.ALL, log_everything), group=-1)
