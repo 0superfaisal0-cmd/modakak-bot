@@ -21,8 +21,8 @@
 
 طريقة العمل:
     - القروب: البوت يرد في قروب المدقق بس (ALLOWED_CHAT_ID) لما ينمنشن أو يرد أحد على رسالته.
-    - الخاص: يرد على صاحب القناة (OWNER_USER_ID) بس. أي أحد ثاني يراسله بالخاص
-      يجيه رد لطيف فيه رابط قروب المدقق.
+    - الخاص: صمت تام لكل الناس (حتى صاحب القناة)، بدون أي رد أو تأكيد.
+    - الحد/الضغط/المهلة: الطلب ينتظر في طابور ويُجاب لاحقًا، بدون رد اعتذار.
     - إذا سأل طالب وش يذاكر أو طلب مصدر: البوت يسأله عن اختباره ومستواه أول،
       وبعدين يرشح من تقييمات القناة (RATINGS) ودليل القدرات (QUDURAT_GUIDANCE) فقط.
     - ممنوع يخترع تقييم أو سعر أو كود خصم أو رابط.
@@ -31,6 +31,7 @@
 """
 
 import os
+import json
 import re
 import time
 import hashlib
@@ -40,7 +41,8 @@ from collections import defaultdict, deque
 
 from telegram import Update
 from telegram.constants import ChatType, ChatMemberStatus, PollType
-from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, filters
+from telegram.ext import (Application, ContextTypes, MessageHandler, CommandHandler, TypeHandler,
+                          ApplicationHandlerStop, filters)
 
 from google import genai
 from google.genai import types, errors as genai_errors
@@ -384,7 +386,7 @@ CLEANUP_EVERY = 300        # كل كم ثانية ينظف البوت مؤقتا
 LOG_MESSAGE_TEXT = os.environ.get("LOG_MESSAGE_TEXT", "0") == "1"
 STALE_NOTICE_CAP = 15      # أقصى عدد إشعارات "رسالة متأخرة" لكل تشغيل
 _stale_notified: set = set()
-PENDING_MAX_AGE = int(os.environ.get("PENDING_MAX_AGE_SECONDS", "3600"))
+PENDING_MAX_AGE = int(os.environ.get("PENDING_MAX_AGE_SECONDS", "0"))   # 0 = لا تجاوز: الطلبات القديمة تُجاب (حد تيليجرام ٢٤ ساعة)
 
 genai_client = genai.Client(
     api_key=GEMINI_API_KEY,
@@ -398,6 +400,7 @@ GEMINI_TOTAL_CAP = 100              # مهلة إجمالية للشرح (ثان
 CHAT_TOTAL_CAP = 60                 # مهلة إجمالية للدردشة (ثانية)
 QUEUE_WAIT_SECONDS = 15             # أقصى انتظار بالطابور قبل الاعتذار (بدل تعليق مفتوح)
 RATE_LIMIT_COOLDOWN = 60            # تهدئة النموذج بعد 429 (حد طلبات)
+DAILY_RECHECK_COOLDOWN = 600         # عند الحد اليومي نعيد الفحص كل ١٠ دقائق
 BUSY_COOLDOWN = 20                  # تهدئة النموذج بعد 503/5xx (ضغط على مزوّد الخدمة)
 # تهدئة لكل نموذج على حدة: النموذج المزدحم عند المزوّد يُتخطى مؤقتًا بدل ما يستهلك
 # محاولات كل طالب، بينما يكمل النموذج الآخر القوي يخدمهم. تُرفع التهدئة تلقائيًا.
@@ -553,17 +556,10 @@ def is_allowed_chat(msg) -> bool:
     فحص العضوية في القناة والقروب يصير قبل الرد."""
     chat = msg.chat
     if chat.type == ChatType.PRIVATE:
-        return True
+        return False   # الخاص: صمت تام لكل الناس
     if ALLOWED_CHAT_ID:
         return str(chat.id) == ALLOWED_CHAT_ID
     return True
-
-
-def not_owner_prompt() -> str:
-    return (
-        "هلا! أنا بوت قروب المدقق وأرد داخل القروب بس 🙏\n"
-        "تعال اسألني هناك: " + GROUP_INVITE_LINK
-    )
 
 
 def should_respond(update: Update) -> bool:
@@ -572,7 +568,7 @@ def should_respond(update: Update) -> bool:
         return False
     chat = msg.chat
     if chat.type == ChatType.PRIVATE:
-        return True
+        return False   # الخاص: ما نرد أبدًا
     text = msg.text.lower()
     # منشن مباشر للبوت
     if f"@{BOT_USERNAME}" in text:
@@ -590,9 +586,10 @@ def should_respond(update: Update) -> bool:
 
 class GeminiAllFailed(Exception):
     """كل النماذج فشلت - يحمل نوع الفشل (quota/busy/timeout/auth/other) للرسالة المناسبة."""
-    def __init__(self, cls, err):
+    def __init__(self, cls, err, scope="unknown"):
         super().__init__(str(err)[:200])
         self.cls = cls
+        self.scope = scope
 
 
 def classify_gemini_error(e) -> str:
@@ -614,6 +611,45 @@ def classify_gemini_error(e) -> str:
     if "timeout" in s or "timed out" in s or "deadline" in s:
         return "timeout"
     return "other"
+
+
+def quota_info(e):
+    """يستخرج من خطأ 429 نطاق الحد (minute/day/unknown) ومهلة الانتظار المقترحة من جوجل (ثوانٍ أو None)
+    ووصفًا قصيرًا للسجل. لا يحتوي نص أي عضو."""
+    import re as _re
+    import json
+    raw = ""
+    try:
+        raw = json.dumps(getattr(e, "details", None) or {}, ensure_ascii=False)
+    except Exception:
+        pass
+    raw = raw + " " + str(e)
+    low = raw.lower()
+    if "perday" in low or "per day" in low or "requests per day" in low:
+        scope = "day"
+    elif "perminute" in low or "per minute" in low:
+        scope = "minute"
+    else:
+        scope = "unknown"
+    retry = None
+    m = _re.search(r'retrydelay[\'"]?\s*[:=]\s*[\'"]?(\d+(?:\.\d+)?)s', low) or \
+        _re.search(r'retry in (\d+(?:\.\d+)?)\s*s', low)
+    if m:
+        retry = float(m.group(1))
+    ids = sorted(set(_re.findall(r'[A-Za-z]+PerProject(?:PerModel)?(?:-[A-Za-z]+)?', raw)))[:3]
+    return scope, retry, ("quota=%s retry=%s" % (",".join(ids) or "?", retry))
+
+
+def daily_reset_text() -> str:
+    """موعد تجدد الحد اليومي: منتصف الليل بتوقيت المحيط الهادئ بتوقيت الرياض (يتبع التوقيت الصيفي تلقائيًا)."""
+    import datetime
+    from zoneinfo import ZoneInfo
+    pac, riy = ZoneInfo("America/Los_Angeles"), ZoneInfo("Asia/Riyadh")
+    now = datetime.datetime.now(pac)
+    nxt = (now + datetime.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    t = nxt.astimezone(riy)
+    h = t.hour % 12 or 12
+    return "%d:%02d %s بتوقيت الرياض" % (h, t.minute, "ص" if t.hour < 12 else "م")
 
 
 async def _call_model(model, contents, system_instruction, temperature, max_tokens):
@@ -638,7 +674,8 @@ async def _gen_chain(contents, system_instruction, temperature, max_tokens, mode
     - كل محاولة لها سقف ATTEMPT_TIMEOUT (قبل: ٢٨.٨ث ثم إعادة على نفس النموذج فيحترق السقف الكلي ولا يُجرَّب الاحتياطي).
     - إعادة المحاولة على نفس النموذج مرة وحدة فقط عند 500/502/503 (فشل سريع يعود غالبًا بثواني).
     - 429 أو 504 أو انتهاء المهلة: ننتقل للنموذج التالي مباشرة، بدون إعادة (ما نضاعف الطلبات ولا نحرق الحصة)."""
-    last_err, last_cls = None, "busy"
+    last_err, last_cls, last_scope = None, "busy", "unknown"
+    _cool_for = {}
     for model in models:
         if time.time() < _model_cooldown.get(model, 0):
             log.info("gemini skip model=%s (cooldown)", model)
@@ -660,19 +697,32 @@ async def _gen_chain(contents, system_instruction, temperature, max_tokens, mode
                     cls = classify_gemini_error(e)
                 last_err, last_cls = e, cls
                 code = getattr(e, "code", None)
+                qdetail = ""
+                if cls == "rate_limit":
+                    last_scope, _retry, qdetail = quota_info(e)
+                    qdetail = " scope=%s %s" % (last_scope, qdetail)
+                    _cool_for[model] = (last_scope, _retry)
                 log.warning(
-                    "gemini fail class=%s model=%s attempt=%s %.1fs: %s",
-                    cls, model, attempt + 1, time.time() - t0, str(e)[:150],
+                    "gemini fail class=%s model=%s attempt=%s %.1fs:%s %s",
+                    cls, model, attempt + 1, time.time() - t0, qdetail, str(e)[:150],
                 )
                 if cls == "busy" and code in (500, 502, 503) and attempt == 0:
                     await asyncio.sleep(1.0)
                     continue
                 break  # غير ذلك: جرّب النموذج التالي فورًا
-        if last_cls == "rate_limit":
-            _model_cooldown[model] = time.time() + RATE_LIMIT_COOLDOWN
+        if last_cls == "rate_limit" and model in _cool_for:
+            sc, rt = _cool_for.pop(model)
+            if sc == "day":
+                cd = DAILY_RECHECK_COOLDOWN      # الحد اليومي: لا فائدة من الإعادة كل دقيقة
+            elif rt:
+                cd = min(max(rt + 1, 5), 180)    # نحترم مهلة جوجل المقترحة
+            else:
+                cd = RATE_LIMIT_COOLDOWN
+            _model_cooldown[model] = time.time() + cd
+            log.info("gemini cooldown model=%s %ss scope=%s", model, int(cd), sc)
         elif last_cls in ("busy", "timeout"):
             _model_cooldown[model] = time.time() + BUSY_COOLDOWN
-    raise GeminiAllFailed(last_cls, last_err)
+    raise GeminiAllFailed(last_cls, last_err, last_scope)
 
 
 async def _generate(contents, system_instruction, temperature=0.7, max_tokens=2048,
@@ -689,30 +739,12 @@ async def _generate(contents, system_instruction, temperature=0.7, max_tokens=20
         GEMINI_SEM.release()
 
 
-# ردود واضحة حسب سبب الفشل
-FAIL_REPLIES = {
-    "rate_limit": "الطلبات كثيرة على خدمة الذكاء الحين 😅 جرب تسألني بعد دقيقة أو دقيقتين.",
-    "busy": "الخدمة ضاغطة الحين 😅 جرب تسألني بعد دقيقة.",
-    "timeout": "الخدمة بطيئة الحين وما ردت بوقتها 😅 جرب تسألني بعد دقيقة.",
-    "auth": "فيه خلل بإعداداتي الحين، بيتحل قريب 🙏",
-    "model_missing": "فيه خلل بإعداداتي الحين، بيتحل قريب 🙏",
-    "api": "ما قدرت أرد الحين 😅 جرب بعد شوي.",
-    "other": "ما قدرت أرد الحين 😅 جرب بعد شوي.",
-}
-
-
 async def ask_gemini(user_key: str, user_text: str) -> str:
     history = histories[user_key]
     contents = list(history) + [types.Content(role="user", parts=[types.Part(text=user_text)])]
     system_instruction = build_system_instruction()
-    try:
-        resp = await _generate(contents, system_instruction, models=CHAT_MODELS, total_cap=CHAT_TOTAL_CAP)
-    except asyncio.TimeoutError:
-        log.warning("gemini total timeout (%s)", user_key)
-        return FAIL_REPLIES["timeout"]
-    except GeminiAllFailed as e:
-        log.warning("gemini all models failed class=%s (%s)", e.cls, user_key)
-        return FAIL_REPLIES.get(e.cls, FAIL_REPLIES["other"])
+    # لا ردود اعتذار جاهزة: الفشل (حد/ضغط/مهلة) يطلع كاستثناء والطابور يعيد المحاولة لاحقًا
+    resp = await _generate(contents, system_instruction, models=CHAT_MODELS, total_cap=CHAT_TOTAL_CAP)
     answer = (resp.text or "").strip()
     try:
         fr = resp.candidates[0].finish_reason
@@ -761,7 +793,7 @@ TAHSILI_SUBJECT_KEYS = {"كيمياء": "كيمياء", "فيزياء": "فيز�
 
 def _safe_extract_zip(zip_path: str, dest_dir: str, exts: tuple) -> int:
     """يفك zip داخل dest_dir مع الحفاظ على المجلدات الفرعية، يتجاهل المسارات غير الآمنة
-    (.. أو مطلقة) والملفات من غير الامتدادات المسموحة، ولا يعيد كتابة ملف موجود بنفس الحجم.
+    (.. أو مطلقة) والملفات من غير الامتدادات المسموحة، ولا يعيد كتابة ملف موجود بنفس الحجم والمحتوى (CRC).
     لو الـzip فيه مجلد أعلى باسم dest_dir نتجاوزه."""
     import zipfile
     top = os.path.basename(dest_dir).lower()
@@ -781,7 +813,11 @@ def _safe_extract_zip(zip_path: str, dest_dir: str, exts: tuple) -> int:
             if not target.startswith(dest_real + os.sep):
                 continue
             if os.path.isfile(target) and os.path.getsize(target) == info.file_size:
-                continue
+                # نفس الحجم لا يكفي (json قديم بنفس الطول بقي ثابتًا): نقارن المحتوى بـCRC
+                import zlib
+                with open(target, "rb") as fh:
+                    if (zlib.crc32(fh.read()) & 0xFFFFFFFF) == info.CRC:
+                        continue
             os.makedirs(os.path.dirname(target), exist_ok=True)
             with zf.open(info) as fsrc, open(target, "wb") as fdst:
                 fdst.write(fsrc.read())
@@ -846,7 +882,11 @@ def load_tahsili_bank() -> list:
 
 
 def ensure_quant_assets():
-    ensure_zip_assets("quant.zip", QUANT_DIR, (".jpg", ".jpeg", ".png", ".json"))
+    """الكمي مقسوم على quant.zip و quant_2.zip و quant_3.zip ... (كل ملف أقل من 25MB) وكلها تُفك في نفس المجلد."""
+    import glob
+    names = ["quant.zip"] + sorted(os.path.basename(p) for p in glob.glob(os.path.join(BASE_DIR, "quant_*.zip")))
+    for nm in names:
+        ensure_zip_assets(nm, QUANT_DIR, (".jpg", ".jpeg", ".png", ".json"))
 
 
 def load_quant_bank() -> list:
@@ -1022,29 +1062,288 @@ async def explain_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if cached:
         await reply_long(msg, f"{head}\n\n{cached}")
         return
-    contents = [types.Content(role="user", parts=parts)]
+    uid = msg.from_user.id if msg.from_user else 0
+    await enqueue_request(context.bot, "explain", msg.chat_id, msg, uid, "",
+                          extra={"parts_text": prompt, "image": quiz.get("image"), "head": head,
+                                 "cache_key": cache_key}, update_id=update.update_id)
+
+
+# ============================================================
+# الطابور: طلبات القروب لا تُرفض ولا يُعتذر عنها - تنتظر وتُجاب لما تتوفر الطاقة
+# (ترتيب لكل شخص، الرد يقتبس رسالته الأصلية). الحدود الصلبة موثقة في التقرير:
+#  - ملف الطابور على Render المجاني يضيع عند إعادة النشر/التشغيل (القرص مؤقت).
+#  - ما فيه ضمان رد بعد إعادة التشغيل: تيليجرام يؤكد التحديث عند استلامه فلا يعيد تسليمه.
+# ============================================================
+import random
+from collections import OrderedDict
+
+QUEUE_FILE = os.environ.get("QUEUE_FILE", "queue.json")
+QUEUE_MAX = int(os.environ.get("QUEUE_MAX", "1000"))          # سقف ذاكرة/ملف (حد صلب، يُسجَّل إن بلغناه)
+QUEUE_WORKERS = int(os.environ.get("QUEUE_WORKERS", "3"))    # أقصى طلبات متزامنة (أشخاص مختلفون)
+BACKOFF_CAP = int(os.environ.get("QUEUE_BACKOFF_CAP", "900"))
+DONE_MAX = 1000
+SEND_GAP = float(os.environ.get("QUEUE_SEND_GAP", "3.5"))   # أقل فاصل بين ردود الطابور في نفس القروب (~17 رسالة/دقيقة، تحت حد تيليجرام للقروبات)
+_send_lock = None
+ITEM_RETRY_DELAY = float(os.environ.get("QUEUE_ITEM_RETRY", "30"))
+_last_send = {}
+_queue: list = []
+_q_running: set = set()
+_done: "OrderedDict" = OrderedDict()
+_backoff_until = 0.0
+_backoff_n = 0
+_q_event = None
+_q_loop_task = None
+_q_tasks: set = set()
+
+
+def _ukey(item) -> str:
+    return f"{item['chat_id']}:{item['uid']}"
+
+
+def queue_save():
     try:
-        await context.bot.send_chat_action(chat_id=msg.chat_id, action="typing")
-        resp = await _generate(contents, build_system_instruction(), temperature=0.3,
-                               max_tokens=1500, models=SMART_MODELS, total_cap=GEMINI_TOTAL_CAP)
-        answer = clean_answer((resp.text or "").strip())
-        if not answer:
-            raise ValueError("empty explanation")
-        explain_cache[cache_key] = answer
-        save_explain_cache()
-        await reply_long(msg, f"{head}\n\n{answer}")
-    except asyncio.TimeoutError:
-        log.warning("explain timeout")
-        await msg.reply_text(f"{head}\nالخدمة بطيئة الحين 😅 قل «اشرح» مرة ثانية بعد دقيقة.")
-    except GeminiAllFailed as e:
-        log.warning("explain failed class=%s: %s", e.cls, str(e)[:120])
-        note = ("الطلبات كثيرة على خدمة الذكاء الحين 😅 قل «اشرح» مرة ثانية بعد دقيقتين."
-                if e.cls == "rate_limit" else
-                "ضغط على الشرح الحين 😅 قل «اشرح» مرة ثانية بعد دقيقة.")
-        await msg.reply_text(f"{head}\n{note}")
+        _atomic_write_json(QUEUE_FILE, {"v": 1, "items": _queue,
+                                        "done": [list(k) for k in _done]})
     except Exception as e:
-        log.warning("explain failed: %s", str(e)[:150])
-        await msg.reply_text(f"{head}\nضغط على الشرح الحين 😅 قل «اشرح» مرة ثانية بعد دقيقة.")
+        log.warning("queue save failed: %s", str(e)[:100])
+
+
+def queue_load():
+    try:
+        with open(QUEUE_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        _queue[:] = [i for i in d.get("items", []) if isinstance(i, dict) and i.get("chat_id", 1) < 0][:QUEUE_MAX]
+        for k in d.get("done", []):
+            _done[(k[0], k[1])] = 1
+        log.info("queue restored: %d pending", len(_queue))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log.warning("queue load failed: %s", str(e)[:100])
+
+
+def _wake():
+    if _q_event is not None:
+        _q_event.set()
+
+
+def _finish(item):
+    try:
+        _queue.remove(item)
+    except ValueError:
+        pass
+    _done[(item["chat_id"], item["msg_id"])] = 1
+    while len(_done) > DONE_MAX:
+        _done.popitem(last=False)
+    queue_save()
+
+
+async def enqueue_request(bot, kind, chat_id, msg, uid, text, extra=None, update_id=None):
+    if chat_id > 0:
+        return    # لا خاص أبدًا
+    key = (chat_id, msg.message_id)
+    if key in _done or any(i["chat_id"] == chat_id and i["msg_id"] == msg.message_id for i in _queue):
+        return    # نسخة مكررة (إعادة تسليم بعد إعادة تشغيل)
+    if len(_queue) >= QUEUE_MAX:
+        log.error("queue full (%d): request not queued chat=%s msg=%s", QUEUE_MAX, chat_id, msg.message_id)
+        return
+    item = {"kind": kind, "chat_id": chat_id, "msg_id": msg.message_id, "uid": uid, "text": text,
+            "update_id": update_id, "ts": time.time(), "tries": 0, "extra": extra or {}}
+    _queue.append(item)
+    queue_save()
+    log.info("queued kind=%s chat=%s user=%s pending=%d", kind, chat_id, uid, len(_queue))
+    _wake()
+
+
+async def _send_reply(bot, item, text):
+    """يرسل الرد (مقتبسًا رسالة السائل). تقسيم للرسائل الطويلة. إعادة محاولة قصيرة عند RetryAfter/شبكة."""
+    if item["chat_id"] > 0:
+        return
+    chunks = []
+    while len(text) > 4000:
+        cut = text.rfind("\n", 0, 4000)
+        if cut < 2000:
+            cut = text.rfind(" ", 0, 4000)
+        if cut < 2000:
+            cut = 4000
+        chunks.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    if text:
+        chunks.append(text)
+    from telegram import ReplyParameters
+    for n, ch in enumerate(chunks):
+        for attempt in range(3):
+            try:
+                kw = {}
+                if n == 0:
+                    kw["reply_parameters"] = ReplyParameters(message_id=item["msg_id"],
+                                                             allow_sending_without_reply=True)
+                async with _send_lock:
+                    wait = _last_send.get(item["chat_id"], 0) + SEND_GAP - time.time()
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    try:
+                        await bot.send_message(chat_id=item["chat_id"], text=ch, **kw)
+                    finally:
+                        _last_send[item["chat_id"]] = time.time()
+                break
+            except Exception as e:
+                ra = getattr(e, "retry_after", None)
+                log.warning("telegram send failed (%s) attempt=%d", type(e).__name__, attempt + 1)
+                if attempt == 2:
+                    return
+                await asyncio.sleep(min(float(ra), 30) if ra else 2 + 3 * attempt)
+
+
+async def _explain_generate(item):
+    ex = item["extra"]
+    parts = [types.Part(text=ex["parts_text"])]
+    if ex.get("image"):
+        ipath = os.path.join(BASE_DIR, ex["image"])
+        with open(ipath, "rb") as fh:
+            parts.append(types.Part.from_bytes(
+                data=fh.read(),
+                mime_type=("image/png" if str(ex["image"]).lower().endswith(".png") else "image/jpeg")))
+    resp = await _generate([types.Content(role="user", parts=parts)], build_system_instruction(),
+                           temperature=0.3, max_tokens=1500, models=SMART_MODELS, total_cap=GEMINI_TOTAL_CAP)
+    answer = clean_answer((resp.text or "").strip())
+    if not answer:
+        raise ValueError("empty explanation")
+    explain_cache[ex["cache_key"]] = answer
+    save_explain_cache()
+    return f"{ex['head']}\n\n{answer}"
+
+
+def _note_failure(item, cls, scope="unknown"):
+    """يحدد مدة الانتظار العامة قبل أي محاولة جديدة. لا حلقة سريعة: أس تصاعدي + عشوائية + سقف."""
+    global _backoff_until, _backoff_n
+    now = time.time()
+    n = _backoff_n
+    _backoff_n += 1
+    drop = False
+    if cls == "rate_limit":
+        rem = [_model_cooldown.get(m, 0) - now for m in set(CHAT_MODELS + SMART_MODELS)]
+        base = max(min(rem), 5)
+        if scope == "unknown":
+            base *= 2 ** min(n, 4)      # 429 غير معروف: لا نعد بوقت ولا نضرب الحصة
+    elif cls in ("busy", "timeout"):
+        base = BUSY_COOLDOWN * 2 ** min(n, 4)
+    elif cls in ("auth", "model_missing"):
+        base = 900                       # إعداد/مفتاح: فحص بطيء، سجل واضح، بدون رد وبدون دوران سريع
+        log.error("queue paused: %s error (check key/model config). pending=%d", cls, len(_queue))
+    else:
+        item["tries"] += 1
+        item["not_before"] = now + ITEM_RETRY_DELAY     # تأخير لهذا الطلب فقط، بدون إيقاف الباقين
+        if item["tries"] >= 3:
+            drop = True
+        _backoff_n = n                     # فشل طلب بعينه ليس ضغطًا على الخدمة
+        return drop
+    base = min(base, BACKOFF_CAP) * (1 + random.uniform(0, 0.2))
+    _backoff_until = max(_backoff_until, now + base)
+    log.info("queue backoff %.0fs class=%s scope=%s n=%d", base, cls, scope, n)
+    return drop
+
+
+async def _process(bot, item):
+    global _backoff_n
+    key = _ukey(item)
+    try:
+        try:
+            await bot.send_chat_action(chat_id=item["chat_id"], action="typing")
+        except Exception:
+            pass
+        try:
+            if item["kind"] == "chat":
+                out = await ask_gemini(key, item["text"])
+            else:
+                out = await _explain_generate(item)
+        except asyncio.CancelledError:
+            raise
+        except GeminiAllFailed as e:
+            if _note_failure(item, e.cls, getattr(e, "scope", "unknown")):
+                log.error("queue: dropping unanswerable request (class=%s) chat=%s msg=%s",
+                          e.cls, item["chat_id"], item["msg_id"])
+                _finish(item)
+            return
+        except asyncio.TimeoutError:
+            _note_failure(item, "timeout")
+            return
+        except Exception as e:
+            log.warning("queue item error %s: %s", type(e).__name__, str(e)[:100])
+            if _note_failure(item, "other"):
+                log.error("queue: dropping failing request chat=%s msg=%s", item["chat_id"], item["msg_id"])
+                _finish(item)
+            return
+        _backoff_n = 0
+        await _send_reply(bot, item, out)
+        _finish(item)
+        log.info("replied to chat %s (queued %.0fs)", item["chat_id"], time.time() - item["ts"])
+    finally:
+        _q_running.discard(key)
+        _wake()
+
+
+async def _queue_loop(bot):
+    while True:
+        try:
+            _q_event.clear()
+            now = time.time()
+            gate = max(_backoff_until,
+                       min(_model_cooldown.get(m, 0) for m in set(CHAT_MODELS + SMART_MODELS)))
+            if gate > now:
+                wait = min(gate - now, 30)
+            else:
+                wait = 30
+                seen = set()
+                for item in list(_queue):
+                    if len(_q_running) >= QUEUE_WORKERS:
+                        break
+                    k = _ukey(item)
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    if k in _q_running:
+                        continue
+                    nb = item.get("not_before", 0)
+                    if nb > now:
+                        wait = min(wait, nb - now)
+                        continue
+                    _q_running.add(k)
+                    t = asyncio.create_task(_process(bot, item))
+                    _q_tasks.add(t)
+                    t.add_done_callback(_q_tasks.discard)
+            try:
+                await asyncio.wait_for(_q_event.wait(), timeout=max(wait, 0.2))
+            except asyncio.TimeoutError:
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("queue loop error: %s", str(e)[:100])
+            await asyncio.sleep(5)
+
+
+async def _queue_start(app):
+    global _q_event, _q_loop_task, _send_lock
+    _q_event = asyncio.Event()
+    _send_lock = asyncio.Lock()
+    _q_loop_task = asyncio.create_task(_queue_loop(app.bot))
+    _wake()
+
+
+async def _queue_stop(app):
+    for t in [_q_loop_task, *list(_q_tasks)]:
+        if t:
+            t.cancel()
+
+
+async def private_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """حارس عام قبل كل المعالجات: أي تحديث من محادثة خاصة (أوامر/أزرار/كويز/شرح/أخطاء/بدء) يُبلع بصمت."""
+    global LAST_UPDATE_TS
+    chat = update.effective_chat
+    if chat is not None and chat.type == ChatType.PRIVATE:
+        LAST_UPDATE_TS = time.time()
+        raise ApplicationHandlerStop
 
 
 def _msg_age_seconds(msg) -> float:
@@ -1064,6 +1363,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
+    if msg.chat.type == ChatType.PRIVATE:
+        return   # صمت تام في الخاص (حماية ثانية؛ الحارس العام يمنع وصولها أصلًا)
 
     # قفل البوت: قروب غير مسموح -> ودّع واطلع منه.
     if not is_allowed_chat(msg):
@@ -1099,13 +1400,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
         return
 
-    # الخاص: لصاحب القناة بس. غيره نوجهه لقروب المدقق.
-    if msg.chat.type == ChatType.PRIVATE:
-        uid = msg.from_user.id if msg.from_user else 0
-        if not (OWNER_USER_ID and str(uid) == OWNER_USER_ID):
-            await msg.reply_text(not_owner_prompt())
-            return
-
     # طلبات الكويز لها مسارها الخاص - ما تمر على النموذج
     if is_quiz_request(msg.text):
         await send_quiz(update, context)
@@ -1119,39 +1413,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # كل شخص له محادثة وذاكرة مستقلة، ونعرّف النموذج باسم المتكلم
     uid = msg.from_user.id if msg.from_user else 0
     name = (msg.from_user.first_name or "يا صديقي") if msg.from_user else "يا صديقي"
-    user_key = f"{chat_id}:{uid}"
-
-    # سؤال سابق لنفس الشخص قيد المعالجة: ننبهه مرة وحدة بدل ما نتجاهله بصمت
-    if user_key in _inflight:
-        if not _inflight[user_key]:
-            _inflight[user_key] = True
-            try:
-                await msg.reply_text("لسه أجاوب سؤالك السابق، لحظات وأرد عليك 🙏")
-            except Exception:
-                pass
-        return
-    _inflight[user_key] = False
-
-    try:
-        log.info("incoming chat=%s user=%s len=%s%s", chat_id, uid, len(msg.text),
-                 (" text=" + msg.text[:60]) if LOG_MESSAGE_TEXT else "")
-        user_text = strip_mention(msg.text).strip()
-        if not user_text:
-            user_text = "سلّم عليهم وعرّفهم بنفسك بجملة وحدة."
-        user_text = f"[{name}] {user_text}"
-        try:
-            await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-            answer = await ask_gemini(user_key, user_text)
-            await reply_long(msg, answer)
-            log.info("replied to chat %s", chat_id)
-        except Exception as e:
-            log.exception("Gemini/Telegram error: %s", e)
-            try:
-                await msg.reply_text("ضغط عليّ شوي الحين 😅 جرب تسألني بعد دقيقة.")
-            except Exception:
-                pass
-    finally:
-        _inflight.pop(user_key, None)
+    log.info("incoming chat=%s user=%s len=%s%s", chat_id, uid, len(msg.text),
+             (" text=" + msg.text[:60]) if LOG_MESSAGE_TEXT else "")
+    user_text = strip_mention(msg.text).strip()
+    if not user_text:
+        user_text = "سلّم عليهم وعرّفهم بنفسك بجملة وحدة."
+    await enqueue_request(context.bot, "chat", chat_id, msg, uid, f"[{name}] {user_text}", update_id=update.update_id)
 
 
 async def on_added_to_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1175,12 +1442,8 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # قروب غير مسموح -> ما يرد (بيطلع منه عند أول رسالة عادية)
     if not is_allowed_chat(msg):
         return
-    # الخاص: لصاحب القناة بس. غيره نوجهه لقروب المدقق.
     if msg.chat.type == ChatType.PRIVATE:
-        uid = msg.from_user.id if msg.from_user else 0
-        if not (OWNER_USER_ID and str(uid) == OWNER_USER_ID):
-            await msg.reply_text(not_owner_prompt())
-            return
+        return
     await msg.reply_text(
         "هلا! أنا المدقق 🤖\n"
         "أجاوب على أسئلتكم عن القدرات والتحصيلي وستيب والقبول الجامعي،\n"
@@ -1192,6 +1455,8 @@ async def on_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """يعطيك معرف المحادثة ومعرفك الشخصي - عشان تعبي متغيرات Render."""
     msg = update.message
+    if not msg or msg.chat.type == ChatType.PRIVATE:
+        return
     user_id = msg.from_user.id if msg.from_user else "؟"
     await msg.reply_text(
         f"معرف هذه المحادثة (chat id): {msg.chat_id}\n"
@@ -1266,12 +1531,15 @@ def build_application() -> Application:
     app = (Application.builder().token(TELEGRAM_BOT_TOKEN)
            .concurrent_updates(True)   # قبل: تحديث واحد كل مرة، سؤال بطيء يوقف الكل
            .build())
+    app.add_handler(TypeHandler(Update, private_guard), group=-2)
     app.add_handler(MessageHandler(filters.ALL, log_everything), group=-1)
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("id", on_id))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_added_to_group))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.add_error_handler(on_error)
+    app.post_init = _queue_start
+    app.post_shutdown = _queue_stop
     return app
 
 
@@ -1282,6 +1550,7 @@ def main():
     QUESTION_BANK["tahsili"] = load_tahsili_bank()
     load_explain_cache()
     load_memory()
+    queue_load()
     log.info("models chat=%s smart=%s", CHAT_MODELS, SMART_MODELS)
     log.info("banks: %s", {k: len(v) for k, v in QUESTION_BANK.items()})
     start_health_server()
